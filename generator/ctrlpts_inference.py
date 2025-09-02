@@ -22,7 +22,7 @@ from assets.icon_process import extract_contours
 # --------------------------
 OBJECT_NPY = "/absolute/path/to/refined_mask.npy"          # <-- npy only
 DIFFUSION_CKPT_PATH = "/absolute/path/to/diffusion.ckpt"
-CLASSIFIER_CKPT_PATH = "/absolute/path/to/classifier.pth"
+# CLASSIFIER_CKPT_PATH = "/absolute/path/to/classifier.pth"
 
 # Model/guide hyper-params: must match training
 NUM_TRAIN_TIMESTEPS   = 1000
@@ -224,19 +224,39 @@ def main():
         classifier_model = nn.DataParallel(classifier_core.to(DEVICE))
     else:
         classifier_model = classifier_core.to(DEVICE)
-    # Load classifier weights (same loader style as train.py)
-    print("Loading classifier checkpoint:", CLASSIFIER_CKPT_PATH)
-    classifier_state = torch.load(CLASSIFIER_CKPT_PATH, map_location=DEVICE)
-    # Allow both plain state_dict and {'state_dict': ...}
-    if isinstance(classifier_state, dict) and "state_dict" in classifier_state:
-        classifier_model.load_state_dict(classifier_state["state_dict"])
-    else:
-        classifier_model.load_state_dict(classifier_state)
+
+    # Load diffusion checkpoint once and extract classifier weights from it
+    print("Loading diffusion checkpoint:", DIFFUSION_CKPT_PATH)
+    ckpt = torch.load(DIFFUSION_CKPT_PATH, map_location=DEVICE)
+    state_dict = ckpt.get("state_dict", ckpt)
+
+    # Try common prefixes for the classifier module in the Lightning state_dict
+    prefixes = [
+        "classifier_model.",
+        "module.classifier_model.",
+    ]
+    clf_sub = {}
+    for pfx in prefixes:
+        clf_sub = {k[len(pfx):]: v for k, v in state_dict.items() if k.startswith(pfx)}
+        if len(clf_sub) > 0:
+            break
+
+    if len(clf_sub) == 0:
+        raise RuntimeError(
+            "Could not find classifier weights in the diffusion checkpoint. "
+            "If your project stores the classifier separately, reintroduce CLASSIFIER_CKPT_PATH and load it explicitly."
+        )
+
+    missing, unexpected = classifier_model.load_state_dict(clf_sub, strict=False)
+    if missing:
+        print("[warn] Missing classifier keys:", missing[:10], "..." if len(missing) > 10 else "")
+    if unexpected:
+        print("[warn] Unexpected classifier keys:", unexpected[:10], "..." if len(unexpected) > 10 else "")
+
     classifier_model.eval()
     for p in classifier_model.parameters():
         p.requires_grad = False
 
-    # 5) Assemble Diffusion module
     diffusion_model = Diffusion(
         noise_pred_net=unet,
         noise_scheduler=scheduler,
@@ -262,10 +282,6 @@ def main():
     ).to(DEVICE)
     diffusion_model.eval()
 
-    # 6) Load diffusion checkpoint (Lightning: use 'state_dict' if present)
-    print("Loading diffusion checkpoint:", DIFFUSION_CKPT_PATH)
-    ckpt = torch.load(DIFFUSION_CKPT_PATH, map_location=DEVICE)
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     diffusion_model.load_state_dict(state_dict, strict=False)
 
     # 7) Run **convergence-only** guided inference and obtain FINAL control points
